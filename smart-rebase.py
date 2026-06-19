@@ -8,13 +8,16 @@ import os
 # -----------------------------
 def run(cmd, cwd=None, check=True):
     print(f"\n$ {cmd}")
+    env = os.environ.copy()
+    env["GIT_EDITOR"] = "true"
 
     result = subprocess.run(
         cmd,
         shell=True,
         text=True,
         capture_output=True,
-        cwd=cwd
+        cwd=cwd,
+        env=env
     )
 
     if result.stdout:
@@ -132,7 +135,7 @@ def resolve_changelog_keep_both(repo, file_path):
 # Rebase control
 # -----------------------------
 def rebase_continue(repo):
-    return git("rebase --continue --no-edi", repo)[0]
+    return git("rebase --continue", repo)[0]
 
 
 # -----------------------------
