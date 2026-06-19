@@ -132,7 +132,7 @@ def resolve_changelog_keep_both(repo, file_path):
 # Rebase control
 # -----------------------------
 def rebase_continue(repo):
-    return git("rebase --continue", repo)[0]
+    return git("rebase --continue --no-edi", repo)[0]
 
 
 # -----------------------------
