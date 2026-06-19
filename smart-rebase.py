@@ -3,7 +3,7 @@ import sys
 import fnmatch
 
 # -----------------------------
-# Utility runner
+# Runner
 # -----------------------------
 def run(cmd, check=True):
     print(f"\n$ {cmd}")
@@ -22,43 +22,92 @@ def run(cmd, check=True):
 
 
 # -----------------------------
-# Conflict detection
+# Backup handling
 # -----------------------------
+BACKUP_BRANCH = None
+
+
+def create_backup(feature_branch):
+    global BACKUP_BRANCH
+    BACKUP_BRANCH = f"{feature_branch}-smart-rebase-backup"
+
+    run(f"git branch {BACKUP_BRANCH}")
+    print(f"🛡️ Backup created: {BACKUP_BRANCH}")
+
+
+def restore_backup():
+    global BACKUP_BRANCH
+
+    if not BACKUP_BRANCH:
+        print("⚠️ No backup branch found")
+        return
+
+    print(f"♻️ Restoring from backup: {BACKUP_BRANCH}")
+
+    run("git rebase --abort", check=False)
+    run(f"git checkout {BACKUP_BRANCH}", check=False)
+    run(f"git branch -D {feature_branch}", check=False)
+    run(f"git checkout -b {feature_branch}", check=False)
+
+
+def delete_backup():
+    global BACKUP_BRANCH
+
+    if not BACKUP_BRANCH:
+        return
+
+    print(f"🧹 Deleting backup branch: {BACKUP_BRANCH}")
+    run(f"git branch -D {BACKUP_BRANCH}", check=False)
+
+
+# -----------------------------
+# Safety checks
+# -----------------------------
+def ensure_clean_worktree():
+    code, out = run("git status --porcelain", check=False)
+    if out.strip():
+        print("❌ Working tree is dirty. Commit or stash first.")
+        sys.exit(1)
+
+
 def get_conflicts():
     code, out = run("git diff --name-only --diff-filter=U", check=False)
     return [f.strip() for f in out.splitlines() if f.strip()]
 
 
-def is_changelog_file(file):
-    # matches:
-    # CHANGELOG.md
-    # CHANGELOG-ADDED.md
-    # CHANGELOG-FIXED.md
-    # etc
+def is_changelog(file):
     return fnmatch.fnmatch(file, "CHANGELOG*.md")
 
 
-def all_conflicts_are_changelog(conflicts):
-    return len(conflicts) > 0 and all(is_changelog_file(f) for f in conflicts)
+def all_changelog(conflicts):
+    return len(conflicts) > 0 and all(is_changelog(f) for f in conflicts)
 
 
 # -----------------------------
-# Resolver
+# Changelog resolver
 # -----------------------------
-def resolve_changelog_file(file):
-    print(f"Auto-resolving: {file}")
+def dedupe(file_path):
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
 
-    # Prefer incoming branch version
+    seen = set()
+    out = []
+
+    for line in lines:
+        clean = line.rstrip("\n")
+        if clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
+def resolve_changelog(file):
+    print(f"🔧 Resolving {file}")
+
     run(f"git checkout --theirs {file}", check=False)
-
-    # Basic cleanup strategy:
-    # - remove duplicates
-    # - keep deterministic ordering
-    run(
-        f"sort -u {file} > {file}.tmp && mv {file}.tmp {file}",
-        check=False
-    )
-
+    dedupe(file)
     run(f"git add {file}")
 
 
@@ -69,15 +118,12 @@ def rebase_continue():
     return run("git rebase --continue", check=False)[0]
 
 
-def abort_rebase():
-    print("Aborting rebase...")
-    run("git rebase --abort", check=False)
-
-
 # -----------------------------
-# Main logic
+# Main
 # -----------------------------
 def main():
+    global feature_branch
+
     if len(sys.argv) != 3:
         print("Usage: python smart_rebase.py <feature-branch> <target-branch>")
         sys.exit(1)
@@ -85,46 +131,53 @@ def main():
     feature_branch = sys.argv[1]
     target_branch = sys.argv[2]
 
-    run("git fetch origin")
+    try:
+        ensure_clean_worktree()
 
-    run(f"git checkout {feature_branch}")
+        run("git fetch origin")
 
-    # Start rebase
-    code, _ = run(f"git rebase origin/{target_branch}", check=False)
+        run(f"git checkout {feature_branch}")
 
-    while True:
+        create_backup(feature_branch)
 
-        # Success
-        if code == 0:
-            print("\n✅ Rebase completed successfully.")
-            break
+        code, _ = run(f"git rebase origin/{target_branch}", check=False)
 
-        # Detect conflicts
-        conflicts = get_conflicts()
+        while True:
 
-        if not conflicts:
-            print("❌ Unknown state: no conflicts but rebase failed")
-            abort_rebase()
-            sys.exit(1)
+            if code == 0:
+                print("\n🎉 Rebase SUCCESS")
 
-        print(f"\n⚠️ Conflicts detected: {conflicts}")
+                delete_backup()
+                break
 
-        # If only changelog files → auto-resolve
-        if all_conflicts_are_changelog(conflicts):
-            print("✅ Only CHANGELOG conflicts detected → auto-resolving")
+            conflicts = get_conflicts()
 
-            for f in conflicts:
-                resolve_changelog_file(f)
+            if not conflicts:
+                raise Exception("Rebase failed with unknown state")
 
-        else:
-            print("❌ Non-changelog conflict detected → aborting")
-            abort_rebase()
-            sys.exit(1)
+            print(f"\n⚠️ Conflicts: {conflicts}")
 
-        # Continue rebase
-        code = rebase_continue()
+            if all_changelog(conflicts):
+                print("🟡 Auto-resolving changelog conflicts")
 
-    print("\n🎉 Done. Branch is clean and rebased.")
+                for f in conflicts:
+                    resolve_changelog(f)
+
+            else:
+                print("❌ Non-changelog conflict → rolling back")
+
+                restore_backup()
+                delete_backup()
+                sys.exit(1)
+
+            code = rebase_continue()
+
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+
+        restore_backup()
+        delete_backup()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
