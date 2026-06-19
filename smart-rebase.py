@@ -1,14 +1,21 @@
 import subprocess
 import sys
 import fnmatch
+import os
 
 # -----------------------------
 # Runner
 # -----------------------------
-def run(cmd, check=True):
+def run(cmd, cwd=None, check=True):
     print(f"\n$ {cmd}")
-    result = subprocess.run(cmd, shell=True, text=True,
-                            capture_output=True)
+
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        text=True,
+        capture_output=True,
+        cwd=cwd
+    )
 
     if result.stdout:
         print(result.stdout.strip())
@@ -21,162 +28,182 @@ def run(cmd, check=True):
     return result.returncode, result.stdout + result.stderr
 
 
-# -----------------------------
-# Backup handling
-# -----------------------------
-BACKUP_BRANCH = None
-
-
-def create_backup(feature_branch):
-    global BACKUP_BRANCH
-    BACKUP_BRANCH = f"{feature_branch}-smart-rebase-backup"
-
-    run(f"git branch {BACKUP_BRANCH}")
-    print(f"🛡️ Backup created: {BACKUP_BRANCH}")
-
-
-def restore_backup():
-    global BACKUP_BRANCH
-
-    if not BACKUP_BRANCH:
-        print("⚠️ No backup branch found")
-        return
-
-    print(f"♻️ Restoring from backup: {BACKUP_BRANCH}")
-
-    run("git rebase --abort", check=False)
-    run(f"git checkout {BACKUP_BRANCH}", check=False)
-    run(f"git branch -D {feature_branch}", check=False)
-    run(f"git checkout -b {feature_branch}", check=False)
-
-
-def delete_backup():
-    global BACKUP_BRANCH
-
-    if not BACKUP_BRANCH:
-        return
-
-    print(f"🧹 Deleting backup branch: {BACKUP_BRANCH}")
-    run(f"git branch -D {BACKUP_BRANCH}", check=False)
+def git(cmd, cwd):
+    return run(f"git {cmd}", cwd=cwd)
 
 
 # -----------------------------
-# Safety checks
+# Safety
 # -----------------------------
-def ensure_clean_worktree():
-    code, out = run("git status --porcelain", check=False)
+def ensure_clean_worktree(repo):
+    code, out = git("status --porcelain", repo)
     if out.strip():
-        print("❌ Working tree is dirty. Commit or stash first.")
+        print("❌ Working tree not clean. Commit or stash first.")
         sys.exit(1)
 
 
-def get_conflicts():
-    code, out = run("git diff --name-only --diff-filter=U", check=False)
+def create_backup(repo, feature_branch):
+    backup = f"{feature_branch}-smart-rebase-backup"
+    git(f"branch {backup}", repo)
+    print(f"🛡️ Backup created: {backup}")
+    return backup
+
+
+def restore_backup(repo, feature_branch, backup):
+    print("♻️ Restoring backup...")
+
+    git("rebase --abort", repo)
+    git(f"checkout {backup}", repo)
+
+    git(f"branch -D {feature_branch}", repo)
+    git(f"checkout -b {feature_branch}", repo)
+
+
+def delete_backup(repo, backup):
+    print(f"🧹 Deleting backup: {backup}")
+    git(f"branch -D {backup}", repo)
+
+
+# -----------------------------
+# Conflicts
+# -----------------------------
+def get_conflicts(repo):
+    code, out = git("diff --name-only --diff-filter=U", repo)
     return [f.strip() for f in out.splitlines() if f.strip()]
 
 
-def is_changelog(file):
+def is_changelog_file(file):
     return fnmatch.fnmatch(file, "CHANGELOG*.md")
 
 
 def all_changelog(conflicts):
-    return len(conflicts) > 0 and all(is_changelog(f) for f in conflicts)
+    return len(conflicts) > 0 and all(is_changelog_file(f) for f in conflicts)
 
 
 # -----------------------------
-# Changelog resolver
+# Conflict resolver (keep both)
 # -----------------------------
-def dedupe(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
+def resolve_changelog_keep_both(repo, file_path):
+    print(f"🔧 Resolving (keep BOTH sides): {file_path}")
+
+    full_path = os.path.join(repo, file_path)
+
+    with open(full_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
-    seen = set()
-    out = []
+    result = []
+    i = 0
 
-    for line in lines:
-        clean = line.rstrip("\n")
-        if clean not in seen:
-            seen.add(clean)
-            out.append(clean)
+    while i < len(lines):
+        line = lines[i]
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+        if line.startswith("<<<<<<<"):
+            ours = []
+            theirs = []
 
+            i += 1
 
-def resolve_changelog(file):
-    print(f"🔧 Resolving {file}")
+            while i < len(lines) and not lines[i].startswith("======="):
+                ours.append(lines[i].rstrip("\n"))
+                i += 1
 
-    run(f"git checkout --theirs {file}", check=False)
-    dedupe(file)
-    run(f"git add {file}")
+            i += 1  # skip =======
+
+            while i < len(lines) and not lines[i].startswith(">>>>>>>"):
+                theirs.append(lines[i].rstrip("\n"))
+                i += 1
+
+            i += 1  # skip >>>>>>>
+
+            result.extend(ours)
+            result.extend(theirs)
+
+        else:
+            result.append(line.rstrip("\n"))
+            i += 1
+
+    with open(full_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(result) + "\n")
+
+    git(f"add {file_path}", repo)
 
 
 # -----------------------------
 # Rebase control
 # -----------------------------
-def rebase_continue():
-    return run("git rebase --continue", check=False)[0]
+def rebase_continue(repo):
+    return git("rebase --continue", repo)[0]
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main():
-    global feature_branch
-
-    if len(sys.argv) != 3:
-        print("Usage: python smart_rebase.py <feature-branch> <target-branch>")
+    if len(sys.argv) != 4:
+        print("Usage: python smart_rebase.py <repo-path> <feature-branch> <target-branch>")
         sys.exit(1)
 
-    feature_branch = sys.argv[1]
-    target_branch = sys.argv[2]
+    repo = os.path.abspath(sys.argv[1])
+    feature = sys.argv[2]
+    target = sys.argv[3]
+
+    backup = None
 
     try:
-        ensure_clean_worktree()
+        ensure_clean_worktree(repo)
 
-        run("git fetch origin")
+        git("fetch origin", repo)
 
-        run(f"git checkout {feature_branch}")
+        git(f"checkout {feature}", repo)
 
-        create_backup(feature_branch)
+        backup = create_backup(repo, feature)
 
-        code, _ = run(f"git rebase origin/{target_branch}", check=False)
+        code, _ = git(f"rebase origin/{target}", repo)
 
         while True:
 
             if code == 0:
                 print("\n🎉 Rebase SUCCESS")
 
-                delete_backup()
+                # 🚀 push rewritten history safely
+                print("🚀 Pushing with --force-with-lease...")
+                push_code, _ = git(f"push --force-with-lease origin {feature}", repo)
+
+                if push_code != 0:
+                    print("❌ Push failed, keeping backup for recovery")
+                    sys.exit(1)
+
+                delete_backup(repo, backup)
                 break
 
-            conflicts = get_conflicts()
+            conflicts = get_conflicts(repo)
 
             if not conflicts:
-                raise Exception("Rebase failed with unknown state")
+                raise Exception("Rebase failed but no conflicts found")
 
             print(f"\n⚠️ Conflicts: {conflicts}")
 
             if all_changelog(conflicts):
-                print("🟡 Auto-resolving changelog conflicts")
+                print("🟡 CHANGELOG conflict → keeping BOTH sides")
 
                 for f in conflicts:
-                    resolve_changelog(f)
+                    resolve_changelog_keep_both(repo, f)
 
             else:
-                print("❌ Non-changelog conflict → rolling back")
-
-                restore_backup()
-                delete_backup()
+                print("❌ Non-changelog conflict → rollback")
+                restore_backup(repo, feature, backup)
+                delete_backup(repo, backup)
                 sys.exit(1)
 
-            code = rebase_continue()
+            code = rebase_continue(repo)
 
     except Exception as e:
         print(f"\n❌ ERROR: {e}")
 
-        restore_backup()
-        delete_backup()
+        if backup:
+            restore_backup(repo, feature, backup)
+            delete_backup(repo, backup)
+
         sys.exit(1)
 
 
